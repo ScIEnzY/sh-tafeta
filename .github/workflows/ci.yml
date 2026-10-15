@@ -1,0 +1,27 @@
+name: ci
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  bash:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - run: sudo apt-get update && sudo apt-get install -y tmux shellcheck
+      - run: shellcheck -x bin/sh-tafeta libexec/setup.bash test/*.sh test/fake-ssh
+      - run: python3 -m py_compile libexec/shtafeta_agent.py libexec/sh-tafeta-sync
+      - run: bash test/smoke.sh
+      - run: bash test/sync.sh
+
+  powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/windows/sh-tafeta.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors; exit 1 }
+          Invoke-ScriptAnalyzer -Path windows/sh-tafeta.ps1 -Severity Error -EnableExit

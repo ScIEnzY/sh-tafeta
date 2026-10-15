@@ -1,0 +1,681 @@
+#!/usr/bin/env python3
+"""sh-tafeta sync — two-way sync of Claude Code projects over SSH that never
+overwrites work it hasn't seen.
+
+Called by `sh-tafeta sync` (which loads the host config). Design in short:
+
+* Decisions use content hashes compared against the state of the last sync
+  (a manifest kept on both machines), never modification times. Clock skew,
+  `git checkout`, `cp` and friends cannot make old content "win".
+* A file changed on one side only is copied. A file changed on both sides is a
+  conflict: nothing is overwritten, the other version is kept next to it.
+* Session transcripts are append-only: if one copy is a byte prefix of the other
+  the missing tail is appended (fast-forward). Otherwise the session was continued
+  on both machines: nothing is overwritten and the other copy is saved aside.
+* Every write is compare-and-swap, replaced files are backed up, nothing is deleted.
+"""
+
+import argparse
+import base64
+import datetime
+import json
+import os
+import re
+import select
+import shlex
+import subprocess
+import sys
+import time
+import uuid
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import shtafeta_agent as A  # noqa: E402
+
+CHUNK = A.CHUNK
+LIVE_SECS = 120
+HOST_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.@-]*$")
+
+if sys.stdout.isatty():
+    RED, GRN, YEL, BLU, DIM, B, R0 = "\033[31m", "\033[32m", "\033[33m", "\033[34m", "\033[2m", "\033[1m", "\033[0m"
+else:
+    RED = GRN = YEL = BLU = DIM = B = R0 = ""
+
+
+CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+MAX_LINE = 64 << 20
+CALL_TIMEOUT = 300
+
+
+def safe(s):
+    """Text that came from the other machine, made harmless for a terminal."""
+    return CTRL.sub("?", str(s))
+
+
+def out(msg=""):
+    print(msg, flush=True)
+
+
+def die(msg, code=1):
+    print("%serror:%s %s" % (RED, R0, msg), file=sys.stderr)
+    sys.exit(code)
+
+
+def tilde(path, home):
+    return "~" + path[len(home):] if path == home or path.startswith(home + "/") else path
+
+
+def ago(seconds):
+    s = int(round(abs(seconds)))
+    if s >= 3600:
+        s = int(round(s / 60.0)) * 60
+    for unit, n in (("d", 86400), ("h", 3600), ("min", 60)):
+        if s >= n:
+            return "%d %s" % (s // n, unit)
+    return "%d s" % s
+
+
+# ---------------------------------------------------------------- transport
+
+class Local:
+    side = "local"
+
+    def __init__(self, claude_dir):
+        self.agent = A.Agent(claude_dir)
+
+    def call(self, op, **args):
+        return getattr(self.agent, "op_" + op)(**args)
+
+    def close(self):
+        self.agent.op_unlock()
+
+
+class Remote:
+    side = "remote"
+
+    def __init__(self, host, claude_dir):
+        src = open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "shtafeta_agent.py"), "rb").read()
+        boot = "import base64;exec(base64.b64decode('%s'))" % base64.b64encode(src).decode()
+        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15",
+               "-o", "ClearAllForwardings=yes",
+               "-o", "ServerAliveCountMax=4", "-C", host, "exec python3 -I -u -c " + shlex.quote(boot)]
+        self.host = host
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.call("init", claude_dir=claude_dir)
+
+    def call(self, op, **args):
+        try:
+            self.proc.stdin.write((json.dumps({"op": op, "args": args}) + "\n").encode())
+            self.proc.stdin.flush()
+            ready, _, _ = select.select([self.proc.stdout], [], [], CALL_TIMEOUT)
+            if not ready:
+                self.proc.kill()
+                raise ConnectionError("%s did not answer for %d s" % (self.host, CALL_TIMEOUT))
+            line = self.proc.stdout.readline(MAX_LINE)
+        except (BrokenPipeError, OSError):
+            line = b""
+        if not line:
+            err = self.proc.stderr.read().decode(errors="replace").strip() if self.proc.poll() is not None else ""
+            if "python3" in err and ("not found" in err or "No such file" in err):
+                raise ConnectionError("python3 is not installed on %s (sh-tafeta needs it there)" % self.host)
+            raise ConnectionError("lost the connection to %s%s" % (self.host, (": " + err.splitlines()[-1]) if err else ""))
+        try:
+            res = json.loads(line)
+            if not isinstance(res, dict) or "ok" not in res:
+                raise ValueError
+        except ValueError:
+            self.proc.kill()
+            raise ConnectionError("%s sent something that is not an sh-tafeta reply" % self.host)
+        if not res["ok"]:
+            raise A.AgentError(res["error"], res.get("kind", "error"))
+        return res["result"]
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=20)
+        except Exception:
+            self.proc.kill()
+
+
+# ---------------------------------------------------------------- paths
+
+def parse_map(text, local_home, remote_home):
+    pairs = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        l, r = line.split("=", 1)
+        pairs.append((os.path.normpath(l), os.path.normpath(r)))
+    return pairs or [(local_home, remote_home)]
+
+
+def map_path(pairs, path, reverse=False):
+    """Translate a path through the longest matching prefix; None if nothing covers it."""
+    best = None
+    for l, r in pairs:
+        src, dst = (r, l) if reverse else (l, r)
+        if A.is_under(path, src) and (best is None or len(src) > len(best[0])):
+            best = (src, dst)
+    if not best:
+        return None
+    mapped = os.path.normpath(best[1] + path[len(best[0]):])
+    return mapped if A.is_under(mapped, best[1]) else None
+
+
+# ---------------------------------------------------------------- planning
+
+def classify(rel, L, R, base, scope):
+    """Decide one file. L/R: scan entries or None. base: sha at last sync or None."""
+    if L and R and L["sha"] == R["sha"]:
+        return {"kind": "same"}
+    if L and not R:
+        if base and L["sha"] == base:
+            # Claude Code's own cleanup must not eat sessions on the other machine; any
+            # other deletion is reported, never propagated nor undone
+            if scope == "claude" and rel.endswith(".jsonl"):
+                return {"kind": "restore", "dir": "L>R"}
+            return {"kind": "deleted", "where": "remote"}
+        return {"kind": "copy", "dir": "L>R"}
+    if R and not L:
+        if base and R["sha"] == base:
+            if scope == "claude" and rel.endswith(".jsonl"):
+                return {"kind": "restore", "dir": "R>L"}
+            return {"kind": "deleted", "where": "local"}
+        return {"kind": "copy", "dir": "R>L"}
+    if not L and not R:
+        return {"kind": "gone"}
+    if base and R["sha"] == base:
+        return {"kind": "copy", "dir": "L>R"}
+    if base and L["sha"] == base:
+        return {"kind": "copy", "dir": "R>L"}
+    return {"kind": "diverged" if rel.endswith(".jsonl") else "conflict"}
+
+
+class Sync:
+    def __init__(self, args, env):
+        self.a = args
+        self.env = env
+        self.run = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        self.stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.problems = 0
+        self.replaced = {}
+
+    # -- connect / select ------------------------------------------------
+
+    def connect(self):
+        host = self.env["SHT_SSH_HOST"]
+        if not HOST_RE.match(host):
+            die("invalid host %r" % host)
+        self.local = Local(self.env.get("SHT_CLAUDE_DIR") or None)
+        try:
+            self.remote = Remote(host, self.env.get("SHT_REMOTE_CLAUDE_DIR") or None)
+            self.rh = self.remote.call("hello")
+        except (ConnectionError, A.AgentError) as e:
+            die(str(e))
+        self.lh = self.local.call("hello")
+        self.live_l = self.local.call("live_sessions")
+        live_r = self.remote.call("live_sessions")
+        self.live_r = [x for x in live_r if isinstance(x, str)] if isinstance(live_r, list) else []
+        if self.rh["machine_id"] == self.lh["machine_id"]:
+            die("local and remote are the same sh-tafeta machine (same state dir / machine id)")
+        self.lname = self.lh["hostname"]
+        self.rname = self.a.host
+        self.pairs = parse_map(self.env.get("SHT_PATH_MAP"), self.lh["home"], self.rh["home"])
+
+    def write_host_conf(self):
+        path = self.env["SHT_HOST_CONF"]
+        if os.path.exists(path):
+            out("%s already exists" % path)
+            return 0
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        q = shlex.quote
+        text = (
+            "# sh-tafeta host config for %s — see `sh-tafeta help sync`\n\n"
+            "# ssh destination (an alias from ~/.ssh/config works best)\n"
+            "SSH_HOST=%s\n\n"
+            "# local=remote path prefixes. Claude Code keys sessions by absolute path, so this is\n"
+            "# what makes a session started in one place resumable in the other.\n"
+            "PATH_MAP=(\n    \"$HOME\"=%s\n)\n\n"
+            "# projects synced when you run `sh-tafeta sync %s` from your home folder\n"
+            "PROJECTS=(\n    # \"$HOME/code/my-project\"\n)\n\n"
+            "# extra excludes for --with-source (.gitignore is always honoured)\n"
+            "# SOURCE_EXCLUDES+=(data/dumps)\n"
+        ) % (self.a.host, q(self.env["SHT_SSH_HOST"]), q(self.rh["home"]), self.a.host)
+        A.atomic_write(path, text.encode(), 0o600)
+        out("wrote %s — review PATH_MAP, then run the sync again" % path)
+        return 0
+
+    def select(self):
+        a, lhome = self.a, self.lh["home"]
+        projects = []
+        if a.all:
+            if a.with_source:
+                die("--with-source needs explicit --project paths (it never runs with --all)")
+            projects += self.local.call("discover")
+            if a.direction != "push":
+                for p in self.remote.call("discover"):
+                    m = map_path(self.pairs, p, reverse=True)
+                    if m:
+                        projects.append(m)
+            projects = [p for p in projects if map_path(self.pairs, p)]
+        elif a.project:
+            projects = [os.path.realpath(os.path.abspath(os.path.expanduser(p))) for p in a.project]
+        else:
+            here = os.path.realpath(self.env.get("SHT_CWD") or os.getcwd())
+            d = here
+            while d != "/" and not os.path.isdir(os.path.join(self.lh["claude_dir"], "projects", A.encode_path(d))):
+                d = os.path.dirname(d)
+            if d != "/" and d != lhome and not self.local.agent.forbidden(d):
+                projects = [d]
+            else:
+                projects = [p for p in (self.env.get("SHT_PROJECTS") or "").splitlines() if p.strip()]
+        seen, final = set(), []
+        for p in projects:
+            p = os.path.normpath(p)
+            if p not in seen:
+                seen.add(p)
+                final.append(p)
+        if not final and not a.with_config:
+            die("no project to sync: run it inside a project, or use --project PATH, --all, or PROJECTS in the host config")
+        self.items = []
+        for i, lp in enumerate(final):
+            rp = map_path(self.pairs, lp)
+            if not rp:
+                die("no PATH_MAP entry covers %s (edit the host config)" % lp)
+            for scope in ["claude"] + (["source"] if a.with_source else []):
+                self.items.append({"scope": scope, "lp": lp, "rp": rp, "rid": "%s:%d" % (scope, i)})
+        if a.with_config:
+            self.items.append({"scope": "config", "lp": "", "rp": "", "rid": "config"})
+
+    # -- plan ------------------------------------------------------------
+
+    def checked_scan(self, files, it):
+        """The other side's file list, minus anything malformed or outside what this
+        side would sync (a well-behaved peer never sends those)."""
+        good, bad = {}, []
+        if not isinstance(files, dict):
+            raise ConnectionError("%s sent a malformed file list" % self.rname)
+        refused = set(self.local.call("allowed", rid=it["rid"], rels=[r for r in files if isinstance(r, str)]))
+        for rel, e in files.items():
+            ok = (isinstance(e, dict) and rel not in refused and isinstance(e.get("sha"), str) and SHA_RE.match(e["sha"])
+                  and isinstance(e.get("size"), int) and e["size"] >= 0
+                  and isinstance(e.get("mtime"), (int, float)) and isinstance(e.get("mode"), int))
+            if ok:
+                good[rel] = e
+            else:
+                bad.append(rel)
+        it["refused"] = bad
+        return good
+
+    def open_and_scan(self, it):
+        ex = [x for x in (self.env.get("SHT_SOURCE_EXCLUDES") or "").splitlines() if x.strip()]
+        it["lroot"] = self.local.call("open", rid=it["rid"], scope=it["scope"], project=it["lp"], excludes=ex)
+        it["rroot"] = self.remote.call("open", rid=it["rid"], scope=it["scope"], project=it["rp"], excludes=ex)
+        it["L"] = self.local.call("scan", rid=it["rid"])["files"]
+        it["R"] = self.checked_scan(self.remote.call("scan", rid=it["rid"]).get("files"), it)
+        lm = self.local.call("manifest_read", peer=self.rh["machine_id"], scope=it["scope"], project=it["lp"])
+        rm = self.remote.call("manifest_read", peer=self.lh["machine_id"], scope=it["scope"], project=it["rp"])
+        it["note"] = None
+        if lm and rm and lm.get("sync_id") == rm.get("sync_id"):
+            it["base"] = lm.get("files", {})
+            it["last"] = lm.get("time")
+        elif lm and rm:
+            lf, rf = lm.get("files", {}), rm.get("files", {})
+            it["base"] = {k: v for k, v in lf.items() if rf.get(k) == v}
+            it["last"] = min(lm.get("time", 0), rm.get("time", 0))
+            it["note"] = "the previous sync did not finish cleanly: being conservative"
+        else:
+            it["base"], it["last"] = {}, None
+            if lm or rm:
+                it["note"] = "sync state found on one side only: being conservative"
+
+    def plan(self, it):
+        L, R, base, scope = it["L"], it["R"], it["base"], it["scope"]
+        acts = []
+        for rel in sorted(set(L) | set(R) | set(base)):
+            l, r = L.get(rel), R.get(rel)
+            c = classify(rel, l, r, base.get(rel), scope)
+            c["rel"] = rel
+            if c["kind"] == "diverged" and l and r:
+                short, long_, side = (l, r, "R") if l["size"] < r["size"] else (r, l, "L")
+                if short["size"] < long_["size"]:
+                    agent = self.remote if side == "R" else self.local
+                    if agent.call("prefix_sha", rid=it["rid"], rel=rel, n=short["size"]) == short["sha"]:
+                        c = {"kind": "ff", "dir": "L>R" if side == "L" else "R>L", "rel": rel}
+            elif c["kind"] == "copy" and rel.endswith(".jsonl") and l and r:
+                src, dst, side = (l, r, "L") if c["dir"] == "L>R" else (r, l, "R")
+                if dst["size"] < src["size"]:
+                    agent = self.local if side == "L" else self.remote
+                    if agent.call("prefix_sha", rid=it["rid"], rel=rel, n=dst["size"]) == dst["sha"]:
+                        c["kind"] = "ff"
+            if self.a.force and c["kind"] in ("conflict", "diverged"):
+                c = {"kind": "copy", "dir": "L>R" if self.a.force == "local" else "R>L", "rel": rel, "forced": True}
+            acts.append(c)
+        # direction filter + live guard
+        now = {"L": self.lh["time"], "R": self.rh["time"]}
+        live = {"L": set(self.live_l), "R": set(self.live_r)}
+        for c in acts:
+            d = c.get("dir")
+            if d:
+                dest = "R" if d == "L>R" else "L"
+                if (self.a.direction == "push" and dest == "L") or (self.a.direction == "pull" and dest == "R"):
+                    c["held"] = True
+                    continue
+                dinfo = (R if dest == "R" else L).get(c["rel"])
+                hello = self.rh if dest == "R" else self.lh
+                sid = c["rel"].split("/", 1)[0]
+                sid = sid[:-6] if sid.endswith(".jsonl") else sid
+                open_there = sid in live[dest]
+                recent = dinfo and hello["claude_running"] and now[dest] - dinfo["mtime"] < LIVE_SECS
+                if c["rel"].endswith(".jsonl") and dinfo and (open_there or recent) and not self.a.include_live:
+                    c["live"] = dest
+        it["acts"] = acts
+
+    # -- display ---------------------------------------------------------
+
+    def show(self):
+        a = self.a
+        arrow = {"push": "->", "pull": "<-", "both": "<->"}[a.direction]
+        out("%ssh-tafeta sync%s  %s %s %s%s" % (B, R0, self.lname, arrow, self.rname,
+                                             "  %s(dry run)%s" % (YEL, R0) if a.dry_run else ""))
+        skew = self.rh["time"] - self.lh["time"]
+        if abs(skew) > 5:
+            out("  %sclock: %s is %s %s (harmless: decisions use content, not dates)%s"
+                % (DIM, self.rname, ago(skew), "ahead" if skew > 0 else "behind", R0))
+        totals = {"problems": 0, "held": 0, "writes": 0}
+        for it in self.items:
+            scope_name = {"claude": "sessions + memory", "source": "source files", "config": "Claude Code config"}[it["scope"]]
+            title = "%s  %s %s" % (tilde(it["lp"], self.lh["home"]), arrow, safe(it["rp"])) if it["lp"] else "~/.claude (allow-list)"
+            out("\n%s%s%s  %s[%s]%s" % (B, title, R0, DIM, scope_name, R0))
+            if it["last"]:
+                out("  %slast sync %s ago%s" % (DIM, ago(time.time() - it["last"]), R0))
+            else:
+                out("  %sfirst sync of this project with %s: only safe moves, everything else is a conflict%s" % (DIM, self.rname, R0))
+            if it.get("refused"):
+                totals["problems"] += 1
+                out("  %s!! %s offered %d file(s) outside what is synced here: ignored%s" % (RED, self.rname, len(it["refused"]), R0))
+            if it["note"]:
+                out("  %s!! %s%s" % (YEL, it["note"], R0))
+            if it["scope"] == "source":
+                lg, rg = it["lroot"].get("git"), it["rroot"].get("git")
+                if lg and rg and lg != rg:
+                    out("  %s!! git: here %s@%s, %s %s@%s — use git for code, this copies working files%s"
+                        % (YEL, safe(lg["branch"]), safe(lg["commit"]), self.rname, safe(rg["branch"]), safe(rg["commit"]), R0))
+            counts = {}
+            lines = []
+            for c in it["acts"]:
+                k = c["kind"]
+                if k in ("same", "gone"):
+                    continue
+                if c.get("held"):
+                    totals["held"] += 1
+                    counts.setdefault("held", 0)
+                    counts["held"] += 1
+                    continue
+                if c.get("live"):
+                    totals["problems"] += 1
+                    lines.append("  %s-- LIVE%s      %s on %s: Claude wrote to it less than %ds ago -> skipped (--include-live)"
+                                 % (YEL, R0, safe(c["rel"]), self.rname if c["live"] == "R" else self.lname, LIVE_SECS))
+                    continue
+                if k == "conflict":
+                    totals["problems"] += 1
+                    lines.append("  %s!! CONFLICT%s  %s changed on both machines -> both kept (.sync-conflict copy)" % (RED, R0, safe(c["rel"])))
+                elif k == "diverged":
+                    totals["problems"] += 1
+                    lines.append("  %s!! DIVERGED%s  %s continued on both machines -> nothing overwritten, other copy saved aside"
+                                 % (RED, R0, safe(c["rel"])))
+                elif k == "deleted":
+                    lines.append("  %s.. deleted%s   %s on %s since the last sync -> not propagated, kept on the other side"
+                                 % (DIM, R0, safe(c["rel"]), self.rname if c["where"] == "remote" else self.lname))
+                else:
+                    totals["writes"] += 1
+                    dest_has = (it["R"] if c["dir"] == "L>R" else it["L"]).get(safe(c["rel"]))
+                    key = (c["dir"], "new" if k == "copy" and not dest_has else k)
+                    counts[key] = counts.get(key, 0) + 1
+                    if c.get("forced"):
+                        lines.append("  %s!! FORCED%s    %s -> replaced on %s (old copy backed up)" % (RED, R0, safe(c["rel"]),
+                                     self.rname if c["dir"] == "L>R" else self.lname))
+                    elif a.verbose:
+                        lines.append("  %s%-9s%s %s %s" % (DIM, k, R0, "->" if c["dir"] == "L>R" else "<-", safe(c["rel"])))
+            for d, label in (("R>L", "%s -> here" % self.rname), ("L>R", "here -> %s" % self.rname)):
+                parts = []
+                for k, word in (("ff", "sessions extended"), ("new", "new"), ("copy", "updated"), ("restore", "restored")):
+                    if counts.get((d, k)):
+                        parts.append("%d %s" % (counts[(d, k)], word))
+                if parts:
+                    out("  %s%-16s%s %s" % (GRN, label, R0, ", ".join(parts)))
+            if counts.get("held"):
+                out("  %s-- %d change(s) on %s not applied (%s only)%s" % (YEL, counts["held"],
+                    self.rname if a.direction == "push" else self.lname, a.direction, R0))
+            for l in lines:
+                out(l)
+            if not counts and not lines:
+                out("  %sin sync%s" % (GRN, R0))
+        if any(it["scope"] == "config" for it in self.items) and a.direction != "push":
+            n = sum(1 for it in self.items if it["scope"] == "config" for c in it["acts"]
+                    if c.get("dir") == "R>L" and not c.get("held") and safe(c["rel"]).split("/")[0] in ("agents", "commands", "skills"))
+            if n:
+                out("\n  %s!! pulling %d agent/command/skill file(s) from %s: they run with your permissions here%s" % (YEL, n, self.rname, R0))
+        out("")
+        if totals["held"] and a.direction != "both":
+            out("%sThe other side has changes this %s will not apply. Wrong machine? Try `sh-tafeta sync %s %s`.%s"
+                % (YEL, a.direction, self.a.host, "pull" if a.direction == "push" else "push", R0))
+        if not a.force:
+            out("Nothing that changed on a destination since the last sync will be overwritten.")
+        else:
+            out("%s--force=%s: files that changed on %s are REPLACED (old copies backed up).%s"
+                % (RED, a.force, self.rname if a.force == "local" else "this machine", R0))
+        return totals
+
+    # -- apply -----------------------------------------------------------
+
+    def agents(self, d):
+        return (self.local, self.remote) if d == "L>R" else (self.remote, self.local)
+
+    def stream(self, src, dst, token, rid, rel, start, end):
+        off = start
+        while off < end:
+            data = src.call("read", rid=rid, rel=rel, off=off, n=min(CHUNK, end - off))
+            if not data:
+                break
+            dst.call("put_chunk", token=token, data=data)
+            off += len(base64.b64decode(data))
+
+    def apply_one(self, it, c):
+        rid, rel = it["rid"], c["rel"]
+        L, R = it["L"].get(rel), it["R"].get(rel)
+        k = c["kind"]
+        if k in ("copy", "restore", "ff"):
+            src, dst = self.agents(c["dir"])
+            s, d = (L, R) if c["dir"] == "L>R" else (R, L)
+            if k == "ff":
+                r = dst.call("append_begin", rid=rid, rel=rel, expect_sha=d["sha"], expect_size=d["size"])
+                if r["changed"]:
+                    return "changed during sync"
+                try:
+                    self.stream(src, dst, r["token"], rid, rel, d["size"], s["size"])
+                    res = dst.call("put_commit", token=r["token"], sha=s["sha"])
+                except Exception:
+                    dst.call("put_abort", token=r["token"])
+                    raise
+            else:
+                t = dst.call("put_begin", rid=rid, rel=rel)["token"]
+                try:
+                    self.stream(src, dst, t, rid, rel, 0, s["size"])
+                    res = dst.call("put_commit", token=t, sha=s["sha"], expect=d["sha"] if d else None,
+                                   mtime=s["mtime"], mode=s["mode"], backup_run=self.run)
+                except Exception:
+                    dst.call("put_abort", token=t)
+                    raise
+            if not res["ok"]:
+                return res["why"]
+            c["done"] = s["sha"]
+            if d and k != "ff":
+                self.replaced[c["dir"]] = self.replaced.get(c["dir"], 0) + 1
+            return None
+        if k in ("conflict", "diverged"):
+            # each side keeps its version and receives the other one aside
+            for d in ("R>L", "L>R"):
+                dest = "L" if d == "R>L" else "R"
+                if (self.a.direction == "push" and dest == "L") or (self.a.direction == "pull" and dest == "R"):
+                    continue
+                src, dst = self.agents(d)
+                s = R if d == "R>L" else L
+                host = self.rname if d == "R>L" else self.lname
+                if k == "conflict" and it["scope"] != "config" and dst.call("has_conflict_copy", rid=rid, rel=rel, sha=s["sha"]):
+                    continue
+                aside = k == "diverged" or it["scope"] == "config"
+                t = dst.call("put_begin", rid=rid, rel=rel, kind="stash" if aside else "conflict",
+                             extra={"run": self.run, "host": host, "stamp": self.stamp})
+                try:
+                    self.stream(src, dst, t["token"], rid, rel, 0, s["size"])
+                    res = dst.call("put_commit", token=t["token"], sha=s["sha"], new_only=True, mtime=s["mtime"])
+                except Exception:
+                    dst.call("put_abort", token=t["token"])
+                    raise
+                if aside and res["ok"]:
+                    c.setdefault("saved", []).append((dest, t["dest"]))
+            return None
+        return None
+
+    def apply(self):
+        failures = []
+        hook = os.environ.get("SHTAFETA_TEST_BEFORE_APPLY")
+        if hook:
+            subprocess.call(hook, shell=True)
+        for it in self.items:
+            for c in it["acts"]:
+                if c["kind"] in ("same", "gone", "deleted") or c.get("held") or c.get("live"):
+                    continue
+                try:
+                    why = self.apply_one(it, c)
+                except A.AgentError as e:
+                    why = str(e)
+                if why:
+                    failures.append((it, c, why))
+        return failures
+
+    def new_base(self, it):
+        base = dict(it["base"])
+        for c in it["acts"]:
+            rel = c["rel"]
+            l, r = it["L"].get(rel), it["R"].get(rel)
+            if c.get("done"):
+                base[rel] = c["done"]
+            elif l and r and l["sha"] == r["sha"]:
+                base[rel] = l["sha"]
+            elif not l and not r:
+                base.pop(rel, None)
+        return base
+
+    def save_state(self):
+        sid = uuid.uuid4().hex
+        now = time.time()
+        for it in self.items:
+            files = self.new_base(it)
+            m = {"version": 1, "sync_id": sid, "time": now, "hosts": [self.lname, self.rname], "files": files}
+            self.remote.call("manifest_write", peer=self.lh["machine_id"], scope=it["scope"], project=it["rp"], manifest=m)
+        for it in self.items:
+            files = self.new_base(it)
+            m = {"version": 1, "sync_id": sid, "time": now, "hosts": [self.lname, self.rname], "files": files}
+            self.local.call("manifest_write", peer=self.rh["machine_id"], scope=it["scope"], project=it["lp"], manifest=m)
+
+    # -- main ------------------------------------------------------------
+
+    def main(self):
+        self.connect()
+        if self.a.init:
+            return self.write_host_conf()
+        if self.a.check:
+            skew = self.rh["time"] - self.lh["time"]
+            out("  %s: python %s, Claude Code dir %s, clock %+.0f s, sh-tafeta protocol %s"
+                % (self.rname, self.rh["python"], "found" if self.rh["claude_dir_exists"] else "MISSING", skew, A.PROTOCOL))
+            return 0 if self.rh["claude_dir_exists"] else 1
+        if not self.rh["claude_dir_exists"]:
+            die("%s has no Claude Code config dir (%s): wrong host, or Claude Code was never run there"
+                % (self.rname, self.rh["claude_dir"]))
+        try:
+            if not self.a.dry_run:
+                self.local.call("lock", owner="sync with %s" % self.rname, break_lock=self.a.break_lock)
+                self.remote.call("lock", owner="sync with %s" % self.lname, break_lock=self.a.break_lock)
+            self.select()
+            for it in self.items:
+                self.open_and_scan(it)
+                self.plan(it)
+            totals = self.show()
+            if self.a.dry_run:
+                return 2 if totals["problems"] else 0
+            if not totals["writes"] and not totals["problems"]:
+                self.save_state()
+                out("%sNothing to do.%s" % (GRN, R0))
+                return 0
+            if not self.a.yes:
+                if not sys.stdin.isatty():
+                    die("not a terminal: add --yes to proceed without confirmation")
+                ans = input("Proceed? [y/N] ")
+                if not ans.lower().startswith("y"):
+                    out("aborted")
+                    return 1
+            failures = self.apply()
+            self.save_state()
+            self.local.call("prune")
+            self.remote.call("prune")
+        except A.AgentError as e:
+            die(str(e))
+        except ConnectionError as e:
+            die("%s — nothing was left half-written (each file is replaced atomically); run the sync again" % e)
+        finally:
+            for side in (getattr(self, "remote", None), getattr(self, "local", None)):
+                if side:
+                    try:
+                        side.call("unlock")
+                    except Exception:
+                        pass
+            if getattr(self, "remote", None):
+                self.remote.close()
+
+        problems = totals["problems"] + len(failures)
+        for it, c, why in failures:
+            out("%s!! skipped%s %s: %s" % (YEL, R0, safe(c["rel"]), safe(why)))
+        for it in self.items:
+            for c in it["acts"]:
+                for dest, path in c.get("saved", []):
+                    out("%s   saved%s the other copy of %s on %s: %s" % (DIM, R0, safe(c["rel"]),
+                        self.lname if dest == "L" else self.rname, path))
+        if problems:
+            out("%sDone, with %d item(s) needing your attention.%s" % (YEL, problems, R0))
+            return 2
+        out("%sDone.%s" % (GRN, R0))
+        for d, n in sorted(self.replaced.items()):
+            where, state = (self.rname, self.rh["state_dir"]) if d == "L>R" else (self.lname, self.lh["state_dir"])
+            out("  %d replaced file(s) backed up on %s in %s/backups/%s" % (n, where, state, self.run))
+        return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog="sh-tafeta sync", add_help=False)
+    p.add_argument("host")
+    p.add_argument("direction", nargs="?", default="both", choices=["push", "pull", "both"])
+    p.add_argument("-n", "--dry-run", action="store_true")
+    p.add_argument("-y", "--yes", action="store_true")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("-p", "--project", action="append")
+    p.add_argument("-a", "--all", action="store_true")
+    p.add_argument("--with-source", action="store_true")
+    p.add_argument("--with-config", action="store_true")
+    p.add_argument("--force", choices=["local", "remote"])
+    p.add_argument("--include-live", action="store_true")
+    p.add_argument("--break-lock", action="store_true")
+    p.add_argument("--init", action="store_true")
+    p.add_argument("--check", action="store_true")
+    args = p.parse_args()
+    try:
+        sys.exit(Sync(args, os.environ).main())
+    except KeyboardInterrupt:
+        die("interrupted — files are replaced atomically, nothing is half-written", 130)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,16 @@
+# ~/.config/sh-tafeta/config — optional, sourced by bash
+
+# Extra arguments when a pane resumes its session (an array keeps quoting intact)
+# SHTAFETA_CLAUDE_ARGS=(--model opus)
+
+# What an unmapped Claude pane does after a restore:
+#   picker (default) = `claude --resume`, choose by hand
+#   new              = start a fresh session
+#   shell            = just give me a shell
+# SHTAFETA_FALLBACK=picker
+
+# Name of the session created when there is nothing to restore
+# SHTAFETA_SESSION=main
+
+# Seconds to wait for tmux-continuum before restoring explicitly
+# SHTAFETA_RESTORE_WAIT=10

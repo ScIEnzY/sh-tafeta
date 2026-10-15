@@ -1,0 +1,946 @@
+#!/usr/bin/env bash
+# sh-tafeta — hand your Claude Code sessions over across reboots, terminals and machines.
+# https://github.com/ScIEnzY/sh-tafeta — MIT License, (c) 2026 Federico Colbertaldo
+#
+# Subcommands (see `sh-tafeta help`):
+#   track      Claude Code hook: remember which session runs in which tmux pane
+#   snapshot   tmux-resurrect post-save hook: freeze the pane map next to the layout snapshot
+#   resume     tmux-resurrect restore command: reopen THIS pane's exact session
+#   restore    start tmux and restore saved sessions (survives the WSL clock jump)
+#   ls, rename, sync, install, uninstall, doctor
+
+set -uo pipefail
+umask 077
+
+VERSION="0.2.0"
+PROG="sh-tafeta"
+
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+CONFIG_DIR="${SHTAFETA_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/sh-tafeta}"
+STATE_DIR="${SHTAFETA_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/sh-tafeta}"
+LIVE_MAP="$STATE_DIR/pane-map.tsv"          # server-pid:pane-id  position  sid  transcript  cwd  epoch
+SAVED_MAP="$STATE_DIR/pane-map.saved.tsv"   # position  sid  transcript  (as of the last layout snapshot)
+MAP_MAX=500
+BOOT_SESSION="_shtafeta_boot"
+NAME_RE='^[A-Za-z0-9_@+-]+$'                # tmux session names we accept (tmux turns '.' and ':' into '_')
+HOST_RE='^[A-Za-z0-9_][A-Za-z0-9_.@-]*$'
+SID_RE='^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+
+# User settings (override in $CONFIG_DIR/config, a bash file)
+SHTAFETA_FALLBACK="${SHTAFETA_FALLBACK:-picker}"      # unmapped Claude pane: picker | new | shell
+SHTAFETA_SESSION="${SHTAFETA_SESSION:-main}"          # session name when there is nothing to restore
+SHTAFETA_RESTORE_WAIT="${SHTAFETA_RESTORE_WAIT:-10}"  # seconds to wait for tmux-continuum
+load_config() {
+    # shellcheck source=/dev/null
+    [[ -f "$CONFIG_DIR/config" ]] && . "$CONFIG_DIR/config"
+    return 0
+}
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+REPO_DIR=$(dirname "$(dirname "$SELF")")
+
+# ---------- helpers ----------
+
+if [[ -t 2 ]]; then
+    C_RED=$'\033[31m' C_GRN=$'\033[32m' C_YEL=$'\033[33m' C_BLU=$'\033[34m' C_B=$'\033[1m' C_0=$'\033[0m'
+else
+    C_RED="" C_GRN="" C_YEL="" C_BLU="" C_B="" C_0=""
+fi
+info() { printf '%s\n' "${C_BLU}::${C_0} $*" >&2; }
+warn() { printf '%s\n' "${C_YEL}!!${C_0} $*" >&2; }
+die()  { printf '%s\n' "${C_RED}error:${C_0} $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Every ssh of ours: never set up the port forwards an ssh alias may define (they
+# belong to your interactive sessions, and a background connection would hold them)
+sshx() { ssh -o ClearAllForwardings=yes "$@"; }
+
+# Single-quote a string for a remote shell
+shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+
+# Read one top-level string field from JSON. Pure bash for plain values (the hook
+# runs on every prompt), jq/python3 when the value has escapes.
+json_field() {   # key json
+    local key=$1 input=$2 re
+    re="\"$key\"[[:space:]]*:[[:space:]]*\"([^\"\\\\]*)\""
+    if [[ $input =~ $re ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    [[ $input == *"\"$key\""* ]] || return 0
+    if have jq; then
+        jq -r --arg k "$key" '.[$k] // empty | strings' <<<"$input" 2>/dev/null
+    elif have python3; then
+        python3 -I -c 'import sys, json
+try:
+    v = json.loads(sys.stdin.read()).get(sys.argv[1])
+except Exception:
+    v = None
+print(v if isinstance(v, str) else "")' "$key" <<<"$input" 2>/dev/null
+    fi
+}
+
+# Drop tabs, newlines and other control characters (the maps are TSV)
+clean() { printf '%s' "${1//[$'\001'-$'\037'$'\177']/}"; }
+
+with_lock() {
+    local lock=$1; shift
+    if have flock; then
+        ( flock -w 5 -x 9 && "$@" ) 9>"$lock"
+    else
+        "$@"
+    fi
+}
+
+find_transcript() {
+    local f
+    for f in "$CLAUDE_DIR"/projects/*/"$1".jsonl; do
+        [[ -f $f ]] && { printf '%s' "$f"; return 0; }
+    done
+    return 1
+}
+
+# ---------- track (Claude Code hook) ----------
+
+# Is the process that runs this hook a nested Claude (claude inside claude,
+# a headless `claude -p` started by a tool...)? Walk up to the pane's shell.
+nested_claude() {   # pane_pid
+    local p=$PPID n=0 comm stat rest
+    [[ -r /proc/$p/stat ]] || return 1
+    while [[ $p -gt 1 && $p != "$1" ]]; do
+        read -r comm <"/proc/$p/comm" 2>/dev/null || return 1
+        [[ $comm == claude ]] && n=$((n + 1))
+        read -r stat <"/proc/$p/stat" 2>/dev/null || return 1
+        rest=${stat##*) }
+        read -r _ p _ <<<"$rest"
+    done
+    [[ $p == "$1" ]] || return 0   # not a descendant of the pane: don't map it
+    # claude may be the pane's own process (`exec claude`): count it too
+    read -r comm <"/proc/$p/comm" 2>/dev/null && [[ $comm == claude ]] && n=$((n + 1))
+    ((n > 1))
+}
+
+_live_upsert() {   # uid position sid transcript cwd
+    local tmp="$LIVE_MAP.tmp.$$" now pids="" uid p
+    printf -v now '%(%s)T' -1
+    # entries of tmux servers that no longer run are useless: the saved map covers them
+    if [[ -f $LIVE_MAP ]]; then
+        while IFS=$'\t' read -r uid _; do
+            p=${uid%%:*}
+            [[ " $pids " == *" $p "* ]] && continue
+            kill -0 "$p" 2>/dev/null && pids+=" $p"
+        done <"$LIVE_MAP"
+    fi
+    {
+        [[ -f $LIVE_MAP ]] && awk -F'\t' -v u="$1" -v s="$3" -v alive="$pids " '
+            { split($1, a, ":") }
+            $1 != u && $3 != s && index(alive, " " a[1] " ")' "$LIVE_MAP"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$now"
+    } | tail -n "$MAP_MAX" >"$tmp" && mv -f "$tmp" "$LIVE_MAP"
+}
+
+cmd_track() {
+    # A hook must never print or fail: Claude Code shows hook output to the user.
+    exec >/dev/null 2>&1
+    load_config
+    [[ -n ${TMUX:-} && -n ${TMUX_PANE:-} ]] || exit 0
+    local input sid tp cwd info uid pos panepid line
+    input=$(head -c 65536) || exit 0
+    sid=$(json_field session_id "$input")
+    [[ $sid =~ $SID_RE ]] || exit 0
+    tp=$(clean "$(json_field transcript_path "$input")")
+    cwd=$(clean "$(json_field cwd "$input")")
+    info=$(tmux display-message -p -t "$TMUX_PANE" $'#{pid}:#{pane_id}\t#S:#I.#P\t#{pane_pid}') || exit 0
+    IFS=$'\t' read -r uid pos panepid <<<"$info"
+    [[ -n $uid && -n $pos ]] || exit 0
+    [[ ${SHTAFETA_TEST_NO_ANCESTRY:-} == 1 ]] || ! nested_claude "$panepid" || exit 0
+    # fast path: nothing changed since the last prompt
+    if [[ -f $LIVE_MAP ]]; then
+        while IFS= read -r line; do
+            [[ $line == "$uid"$'\t'"$pos"$'\t'"$sid"$'\t'"$tp"$'\t'* ]] && exit 0
+        done <"$LIVE_MAP"
+    fi
+    mkdir -p "$STATE_DIR" || exit 0
+    with_lock "$LIVE_MAP.lock" _live_upsert "$uid" "$pos" "$sid" "$tp" "${cwd:-$PWD}"
+    exit 0
+}
+
+# ---------- snapshot (tmux-resurrect post-save hook) ----------
+
+# Freeze "position -> session" at the moment tmux-resurrect saves the layout, so a
+# restore puts every conversation back in the pane that the layout snapshot puts
+# back — even if panes moved around after the last prompt.
+# The map that goes with the layout snapshot `last` points to (a restore of an older
+# snapshot then gets that snapshot's sessions, not the newest ones)
+snapshot_map_for_last() {
+    local last
+    last=$(readlink -f "$(resurrect_save_dir)/last" 2>/dev/null) || return 0
+    [[ -n $last ]] && printf '%s' "$STATE_DIR/snapshots/${last##*/}.tsv"
+}
+
+_snapshot() {
+    local tmp="$SAVED_MAP.tmp.$$" snap dir
+    tmux list-panes -a -F $'#{pid}:#{pane_id}\t#S:#I.#P' 2>/dev/null |
+        awk -F'\t' 'NR == FNR { sid[$1] = $3; tp[$1] = $4; next }
+                    ($1 in sid) { print $2 "\t" sid[$1] "\t" tp[$1] }' "$LIVE_MAP" - >"$tmp" &&
+        mv -f "$tmp" "$SAVED_MAP"
+    snap=$(snapshot_map_for_last)
+    if [[ -n $snap ]]; then
+        dir=${snap%/*}
+        mkdir -p "$dir" && cp -f "$SAVED_MAP" "$snap"
+        # keep the maps of the last 100 snapshots
+        find "$dir" -maxdepth 1 -name '*.tsv' -type f -printf '%T@ %p\n' 2>/dev/null |
+            sort -rn | tail -n +101 | cut -d' ' -f2- | xargs -r rm -f
+    fi
+}
+
+cmd_snapshot() {
+    exec >/dev/null 2>&1
+    [[ -f $LIVE_MAP ]] || exit 0
+    with_lock "$LIVE_MAP.lock" _snapshot
+    exit 0
+}
+
+# ---------- resume (tmux-resurrect restore command) ----------
+
+lookup_map() {   # file position-column position -> "sid<TAB>transcript"
+    [[ -f $1 ]] || return 1
+    awk -F'\t' -v c="$2" -v p="$3" '$c == p { if (c == 1) print $2 "\t" $3; else print $3 "\t" $4; exit }' "$1"
+}
+
+resurrect_last_command() {   # position -> full command saved by tmux-resurrect for that pane
+    local last
+    last="$(resurrect_save_dir)/last"
+    [[ -f $last ]] || return 1
+    awk -F'\t' -v p="$1" '$1 == "pane" && ($2 ":" $3 "." $6) == p { c = $NF; sub(/^:/, "", c); print c; exit }' "$last"
+}
+
+cmd_resume() {
+    load_config
+    local dry=0 pos="" line sid="" tp="" orig first
+    [[ ${1:-} == --dry-run ]] && dry=1
+    if [[ -n ${TMUX_PANE:-} ]]; then
+        pos=$(tmux display-message -p -t "$TMUX_PANE" '#S:#I.#P' 2>/dev/null)
+    fi
+    if [[ -n $pos ]]; then
+        line=$(lookup_map "$(snapshot_map_for_last)" 1 "$pos")
+        [[ -n $line ]] || line=$(lookup_map "$SAVED_MAP" 1 "$pos")
+        if [[ -z $line && -f $LIVE_MAP ]]; then
+            # only entries written under this very tmux server: older ones point at panes
+            # that no longer exist, possibly at the same position
+            local spid
+            spid=$(tmux display-message -p '#{pid}' 2>/dev/null)
+            line=$(awk -F'\t' -v p="$pos" -v s="$spid:" '$2 == p && index($1, s) == 1 { print $3 "\t" $4; exit }' "$LIVE_MAP")
+        fi
+        IFS=$'\t' read -r sid tp <<<"$line"
+        [[ $sid =~ $SID_RE ]] || sid=""
+        if [[ -n $sid && ! -f $tp ]]; then
+            tp=$(find_transcript "$sid") || sid=""
+        fi
+        orig=$(resurrect_last_command "$pos")
+        if [[ -z $sid && $orig =~ (^|[[:space:]])--resume[=[:space:]]([A-Za-z0-9][A-Za-z0-9._-]*) ]]; then
+            # no map entry, but the saved command line says which session it was
+            sid=${BASH_REMATCH[2]}
+            tp=$(find_transcript "$sid") || sid=""
+        fi
+        if [[ -z $sid ]]; then
+            # "~claude" also matches e.g. `less notes-for-claude.md`. tmux-resurrect saved that
+            # command line without its quoting, so running it again through a shell could run
+            # something else entirely: show it and give the pane a shell instead.
+            first=${orig%% *}
+            # a claude started through an interpreter shows up as "/bin/bash .../claude ..."
+            if [[ -n $orig && ${first##*/} != claude* && ! $orig =~ ^[^[:space:]]+[[:space:]]+[^[:space:]]*/?claude([[:space:]]|$) ]]; then
+                if ((dry)); then printf 'shell (was: %s)\n' "$(clean "$orig")"; return 0; fi
+                printf 'sh-tafeta: this pane was running: %s\n' "$(clean "$orig")" >&2
+                exec "${SHELL:-bash}"
+            fi
+        fi
+    fi
+
+    local -a cmd=(claude) extra=()
+    if declare -p SHTAFETA_CLAUDE_ARGS 2>/dev/null | grep -q '^declare -a'; then
+        extra=("${SHTAFETA_CLAUDE_ARGS[@]}")
+    elif [[ -n ${SHTAFETA_CLAUDE_ARGS:-} ]]; then
+        set -f
+        # shellcheck disable=SC2206  # a plain string is split on spaces, globbing disabled
+        extra=($SHTAFETA_CLAUDE_ARGS)
+        set +f
+    fi
+    cmd+=("${extra[@]}")
+    if [[ -n $sid ]]; then
+        cmd+=(--resume "$sid")
+    else
+        # Never `claude --continue`: with several panes in the same folder it would
+        # open the same conversation everywhere.
+        case $SHTAFETA_FALLBACK in
+            new)   ;;
+            shell) cmd=("${SHELL:-bash}") ;;
+            *)     cmd+=(--resume) ;;
+        esac
+    fi
+
+    if ((dry)); then
+        printf '%s\n' "${cmd[*]}"
+        return 0
+    fi
+    if [[ -n $sid && -n ${TMUX_PANE:-} ]]; then
+        # record this pane now: the next layout snapshot must know it even if no prompt
+        # (hence no hook) happens before another reboot
+        local info uid
+        info=$(tmux display-message -p -t "$TMUX_PANE" $'#{pid}:#{pane_id}\t#S:#I.#P' 2>/dev/null)
+        IFS=$'\t' read -r uid pos <<<"$info"
+        if [[ -n $uid && -n $pos ]] && mkdir -p "$STATE_DIR"; then
+            with_lock "$LIVE_MAP.lock" _live_upsert "$uid" "$pos" "$sid" "$tp" "$PWD"
+        fi
+    fi
+    if ! have "${cmd[0]}"; then
+        warn "'${cmd[0]}' not found in PATH: starting a shell instead (session: ${sid:-none})"
+        exec "${SHELL:-bash}"
+    fi
+    exec "${cmd[@]}"
+}
+
+# ---------- restore (boot) ----------
+
+resurrect_plugin_dir() {
+    local d
+    for d in "${TMUX_PLUGIN_MANAGER_PATH:-}" "$HOME/.tmux/plugins" "${XDG_CONFIG_HOME:-$HOME/.config}/tmux/plugins"; do
+        [[ -n $d && -d ${d%/}/tmux-resurrect ]] && { printf '%s' "${d%/}/tmux-resurrect"; return 0; }
+    done
+    return 1
+}
+
+resurrect_save_dir() {
+    local d
+    d=$(tmux show-option -gqv @resurrect-dir 2>/dev/null)
+    d=${d//\~/$HOME}
+    d=${d//\$HOME/$HOME}
+    d=${d//\$HOSTNAME/$(hostname)}
+    if [[ -z $d ]]; then
+        if [[ -d $HOME/.tmux/resurrect ]]; then d="$HOME/.tmux/resurrect"
+        else d="${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect"; fi
+    fi
+    printf '%s' "$d"
+}
+
+other_sessions() { tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -vxF "$BOOT_SESSION"; }
+
+wait_restored() {   # marker seconds — true once tmux-resurrect reported a finished restore
+    local i
+    for ((i = 0; i < $2 * 4; i++)); do
+        [[ -e $1 ]] && return 0
+        sleep 0.25
+    done
+    return 1
+}
+
+cmd_restore() {
+    load_config
+    have tmux || die "tmux not found"
+    if tmux list-sessions >/dev/null 2>&1; then
+        info "tmux is already running ($(tmux list-sessions 2>/dev/null | wc -l) sessions): nothing to restore"
+        return 0
+    fi
+    mkdir -p "$STATE_DIR"
+    rm -f "$STATE_DIR"/restored.* 2>/dev/null   # markers of earlier boots (pids get reused)
+    tmux new-session -d -s "$BOOT_SESSION" -c "$HOME" || die "cannot start tmux"
+    local last marker plugin
+    last="$(resurrect_save_dir)/last"
+    if [[ ! -e $last ]]; then
+        tmux rename-session -t "=$BOOT_SESSION" "$SHTAFETA_SESSION" 2>/dev/null
+        info "no saved layout yet: started an empty '$SHTAFETA_SESSION' session"
+        return 0
+    fi
+    # tmux/sh-tafeta.tmux makes tmux-resurrect touch this file when a restore completes
+    marker="$STATE_DIR/restored.$(tmux display-message -p '#{pid}' 2>/dev/null)"
+    info "restoring the saved layout..."
+    if ! wait_restored "$marker" "$SHTAFETA_RESTORE_WAIT"; then
+        # tmux-continuum only auto-restores if the tmux server started less than
+        # @continuum-restore-max-delay (10s) ago. On WSL2 the clock can jump forward
+        # by minutes right after boot, so continuum thinks the server is old and
+        # silently skips the restore — and 10 minutes later overwrites `last` with
+        # an empty layout. Run the tmux-resurrect restore ourselves.
+        if plugin=$(resurrect_plugin_dir) && [[ -z $(other_sessions) ]]; then
+            warn "tmux-continuum did not restore (clock jump?): running tmux-resurrect restore"
+            "$plugin/scripts/restore.sh" >/dev/null 2>&1
+            wait_restored "$marker" 5
+        fi
+    fi
+    rm -f "$STATE_DIR"/restored.* 2>/dev/null
+    local n
+    n=$(other_sessions | wc -l)
+    if ((n > 0)); then
+        tmux kill-session -t "=$BOOT_SESSION" 2>/dev/null
+        info "${C_GRN}restored $n session(s)${C_0}"
+    else
+        tmux rename-session -t "=$BOOT_SESSION" "$SHTAFETA_SESSION" 2>/dev/null
+        warn "nothing was restored: started an empty '$SHTAFETA_SESSION' session"
+        warn "snapshots are in $(resurrect_save_dir)/ (see README: recovering a snapshot)"
+    fi
+}
+
+cmd_restored_mark() {
+    mkdir -p "$STATE_DIR" && : >"$STATE_DIR/restored.$(tmux display-message -p '#{pid}' 2>/dev/null)"
+}
+
+# ---------- ls ----------
+
+cmd_ls() {
+    local host="" fmt out
+    while (($#)); do
+        case $1 in
+            -h|--help) echo "usage: $PROG ls [HOST]"; return 0 ;;
+            -*) die "unknown option: $1" ;;
+            *) host=$1 ;;
+        esac
+        shift
+    done
+    fmt=$'#{session_name}\t#{session_windows}\t#{session_attached}\t#{pane_current_command}\t#{session_path}'
+    if [[ -n $host ]]; then
+        [[ $host =~ $HOST_RE ]] || die "invalid host name: $host"
+        out=$(sshx -o ConnectTimeout=10 -- "$host" "tmux list-sessions -F $(shq "$fmt")") || die "no tmux sessions on $host (or host unreachable)"
+    else
+        out=$(tmux list-sessions -F "$fmt" 2>/dev/null) || die "no tmux server running (try: $PROG restore)"
+    fi
+
+    local name win att cmd path claude
+    # shellcheck disable=SC2059
+    printf "${C_B}%-22s %4s %3s %7s  %-12s %s${C_0}\n" SESSION WIN ATT CLAUDE COMMAND PATH
+    while IFS=$'\t' read -r name win att cmd path; do
+        [[ $name == "$BOOT_SESSION" ]] && continue
+        [[ $win =~ ^[0-9]+$ ]] || win="?"           # never trust remote output in arithmetic
+        if [[ $att =~ ^[0-9]+$ && $att != 0 ]]; then att="*"; else att=""; fi
+        claude="-"
+        if [[ -z $host && -f $LIVE_MAP ]]; then
+            claude=$(awk -F'\t' -v s="$name:" 'index($2, s) == 1' "$LIVE_MAP" | wc -l)
+        fi
+        printf '%-22s %4s %3s %7s  %-12s %s\n' "$(clean "$name")" "$win" "$att" "$claude" "$(clean "$cmd")" "$(clean "${path/#$HOME/\~}")"
+    done <<<"$out"
+}
+
+# ---------- rename ----------
+
+_map_rename_session() {   # old new
+    local f tmp col
+    for f in "$LIVE_MAP" "$SAVED_MAP"; do
+        [[ -f $f ]] || continue
+        if [[ $f == "$LIVE_MAP" ]]; then col=2; else col=1; fi
+        tmp="$f.tmp.$$"
+        awk -F'\t' -v OFS='\t' -v c="$col" -v o="$1:" -v n="$2:" \
+            'index($c, o) == 1 { $c = n substr($c, length(o) + 1) } { print }' "$f" >"$tmp" && mv -f "$tmp" "$f"
+    done
+}
+
+cmd_rename() {
+    local old=${1:-} new=${2:-} host=${3:-}
+    [[ -n $old && -n $new ]] || die "usage: $PROG rename OLD NEW [HOST]"
+    [[ $new =~ $NAME_RE ]] || die "session names may only contain letters, digits, '_', '-', '@', '+'"
+    if [[ -n $host ]]; then
+        [[ $host =~ $HOST_RE ]] || die "invalid host name: $host"
+        # use the remote sh-tafeta when available, so remote pane mappings follow too
+        sshx -o ConnectTimeout=10 -- "$host" "
+            s=\$(command -v $PROG 2>/dev/null || { [ -x \"\$HOME/.local/bin/$PROG\" ] && echo \"\$HOME/.local/bin/$PROG\"; })
+            if [ -n \"\$s\" ]; then \"\$s\" rename $(shq "$old") $(shq "$new")
+            else tmux rename-session -t $(shq "=$old") $(shq "$new") && echo 'note: $PROG not installed on the remote: pane mappings not updated' >&2; fi" \
+            || die "rename failed on $host"
+    else
+        tmux rename-session -t "=$old" "$new" || die "no session named '$old'"
+        mkdir -p "$STATE_DIR"
+        with_lock "$LIVE_MAP.lock" _map_rename_session "$old" "$new"
+    fi
+    info "renamed '$old' -> '$new'${host:+ on $host}"
+}
+
+# ---------- shot (screenshots -> Claude Code) ----------
+
+SHOT_EXT_RE='^(png|jpe?g|gif|webp|bmp)$'
+# shellcheck disable=SC2016  # expanded on the target machine
+DEFAULT_SHOTS_DIR='$HOME/.cache/sh-tafeta/screenshots'
+# shellcheck disable=SC2016
+SHOTS_DIR_RE='^(\$HOME/|~/|/)[A-Za-z0-9/._-]+$'
+
+# Runs on the target (sh): store stdin as DIR/NAME without overwriting anything,
+# private to the user, prune old files if asked, print the absolute path.
+# shellcheck disable=SC2016
+SHOT_PUT='umask 077
+d=$1; n=$2; keep=$3
+case $d in "\$HOME"/*) d="$HOME/${d#?HOME/}" ;; "~"/*) d="$HOME/${d#??}" ;; esac
+case $d in "$HOME"|"$HOME"/|/|"$HOME"/.ssh*|"$HOME"/.config|"$HOME"/.config/|"$HOME"/.local|"$HOME"/.gnupg*) exit 5 ;; esac
+# a folder sh-tafeta creates is marked as its own: only there it sets 700 and prunes
+if [ ! -e "$d" ]; then mkdir -p "$d" && chmod 700 "$d" && : > "$d/.sh-tafeta-shots" || exit 3; fi
+[ -d "$d" ] && [ ! -L "$d" ] || exit 3
+stem=${n%.*}; ext=${n##*.}; f=$n; i=1
+while [ -e "$d/$f" ]; do f="$stem-$i.$ext"; i=$((i + 1)); done
+t="$d/.tmp-$$-$f"
+if ! cat > "$t"; then rm -f "$t"; exit 4; fi
+mv -f "$t" "$d/$f" || exit 4
+if [ -f "$d/.sh-tafeta-shots" ]; then
+    case $keep in ""|*[!0-9]*|0) ;; *) find "$d" -maxdepth 1 -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.gif" -o -name "*.webp" -o -name "*.bmp" \) ! -name ".*" -mtime +"$keep" -exec rm -f {} + ;; esac
+fi
+printf "SHTAFETA-PATH:%s\n" "$(cd "$d" && pwd -P)/$f"'
+
+shot_name() {   # path -> safe file name (the original file is never renamed)
+    local base=${1##*/} ext stem
+    ext=${base##*.}
+    ext=${ext,,}
+    stem=${base%.*}
+    stem=${stem//[^A-Za-z0-9._-]/_}
+    stem=$(printf '%s' "$stem" | tr -s '_')
+    [[ $stem == [A-Za-z0-9]* ]] || stem="shot$stem"
+    printf '%s.%s' "${stem:0:100}" "$ext"
+}
+
+cmd_shot() {
+    local target=${1:-${SHT_SHOT_TARGET:-}}
+    (($#)) && shift
+    local -a files=("$@")
+    ((${#files[@]})) || [[ -z ${SHT_SHOT_FILE:-} ]] || files=("$SHT_SHOT_FILE")
+    if [[ -z $target || ${#files[@]} -eq 0 || $target == -h || $target == --help ]]; then
+        echo "usage: $PROG shot HOST|local FILE...   copy images where Claude Code runs, print their paths"
+        [[ $target == -h || $target == --help ]] && return 0 || return 1
+    fi
+
+    local SSH_HOST="" SHOTS_DIR=${SHOTS_DIR:-} SHOTS_KEEP_DAYS=${SHOTS_KEEP_DAYS:-30} remote=1
+    if [[ $target == local || $target == wsl ]]; then
+        remote=0
+    else
+        [[ $target =~ $HOST_RE ]] || die "invalid host name: $target"
+        SSH_HOST=$target
+        # shellcheck disable=SC2034  # other keys of the host config, unused here
+        local PATH_MAP PROJECTS SOURCE_EXCLUDES REMOTE_CLAUDE_DIR TRANSPORT
+        # shellcheck source=/dev/null
+        [[ -f $CONFIG_DIR/hosts/$target.conf ]] && . "$CONFIG_DIR/hosts/$target.conf"
+        [[ $SSH_HOST =~ $HOST_RE ]] || die "invalid SSH_HOST for $target"
+    fi
+    SHOTS_DIR=${SHOTS_DIR:-$DEFAULT_SHOTS_DIR}
+    [[ $SHOTS_DIR =~ $SHOTS_DIR_RE && $SHOTS_DIR != *..* && $SHOTS_DIR != */./* && $SHOTS_DIR != */. && $SHOTS_DIR != *// ]] ||
+        die "invalid SHOTS_DIR: $SHOTS_DIR"
+    [[ $SHOTS_KEEP_DAYS =~ ^[0-9]+$ ]] || die "invalid SHOTS_KEEP_DAYS: $SHOTS_KEEP_DAYS"
+
+    local f name ext size out rc=0
+    for f in "${files[@]}"; do
+        [[ -f $f ]] || { warn "no such file: $f"; rc=1; continue; }
+        name=$(shot_name "$f")
+        ext=${name##*.}
+        [[ $ext =~ $SHOT_EXT_RE ]] || { warn "not an image: $f"; rc=1; continue; }
+        size=$(stat -c %s "$f" 2>/dev/null || echo 0)
+        ((size > 0 && size <= 50 * 1024 * 1024)) || { warn "empty or larger than 50 MB: $f"; rc=1; continue; }
+        if ((remote)); then
+            # one ssh connection kept for 10 minutes: the next screenshots go out instantly.
+            # Its socket needs a short path (108 bytes max) in a dir only we can use.
+            local cmdir="${XDG_RUNTIME_DIR:-/tmp}/sht-$UID"
+            [[ -e $cmdir ]] || mkdir -m 700 "$cmdir" 2>/dev/null
+            if [[ -d $cmdir && ! -L $cmdir && -O $cmdir ]]; then chmod 700 "$cmdir"; else die "unsafe control socket dir: $cmdir"; fi
+            out=$(sshx -o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPersist=600 \
+                -o "ControlPath=$cmdir/%C" -- "$SSH_HOST" \
+                "sh -c $(shq "$SHOT_PUT") sh $(shq "$SHOTS_DIR") $(shq "$name") $(shq "$SHOTS_KEEP_DAYS")" <"$f") || out=""
+        else
+            out=$(sh -c "$SHOT_PUT" sh "$SHOTS_DIR" "$name" "$SHOTS_KEEP_DAYS" <"$f") || out=""
+        fi
+        out=$(printf '%s\n' "$out" | sed -n 's/^SHTAFETA-PATH://p' | tail -n1)
+        out=$(clean "$out")
+        if [[ $out == /* ]]; then printf '%s\n' "$out"; else warn "could not deliver $f to $target"; rc=1; fi
+    done
+    return "$rc"
+}
+
+# ---------- sync (engine in libexec/sh-tafeta-sync) ----------
+
+DEFAULT_SOURCE_EXCLUDES=(node_modules .next .nuxt dist build .turbo .angular .venv venv __pycache__ '*.pyc' coverage .cache)
+
+cmd_sync() {
+    local host="" skip=0 a
+    for a in "$@"; do
+        if ((skip)); then skip=0; continue; fi
+        case $a in
+            -h|--help) help_sync; return 0 ;;
+            -p|--project) skip=1 ;;
+            -*|push|pull|both) ;;
+            *) [[ -z $host ]] && host=$a ;;
+        esac
+    done
+    [[ -n $host ]] || { help_sync; exit 1; }
+    [[ $host =~ $HOST_RE ]] || die "invalid host name: $host"
+    have python3 || die "sync needs python3"
+
+    local SSH_HOST=$host REMOTE_CLAUDE_DIR=""
+    local -a PATH_MAP=() PROJECTS=() SOURCE_EXCLUDES=("${DEFAULT_SOURCE_EXCLUDES[@]}")
+    local conf="$CONFIG_DIR/hosts/$host.conf"
+    # shellcheck source=/dev/null
+    [[ -f $conf ]] && . "$conf"
+    [[ $SSH_HOST =~ $HOST_RE ]] || die "invalid SSH_HOST in $conf"
+
+    SHT_SSH_HOST=$SSH_HOST \
+    SHT_PATH_MAP=$(printf '%s\n' "${PATH_MAP[@]}") \
+    SHT_PROJECTS=$(printf '%s\n' "${PROJECTS[@]}") \
+    SHT_SOURCE_EXCLUDES=$(printf '%s\n' "${SOURCE_EXCLUDES[@]}") \
+    SHT_REMOTE_CLAUDE_DIR=$REMOTE_CLAUDE_DIR \
+    SHT_HOST_CONF=$conf \
+    SHT_CLAUDE_DIR=$CLAUDE_DIR \
+    SHT_CWD=$PWD \
+    SHTAFETA_STATE_DIR=$STATE_DIR \
+        exec python3 "$REPO_DIR/libexec/sh-tafeta-sync" "$@"
+}
+
+# ---------- install / uninstall ----------
+
+TMUX_SNIPPET="$REPO_DIR/tmux/sh-tafeta.tmux"
+
+tmux_conf_path() {
+    if [[ -e $HOME/.tmux.conf ]]; then printf '%s' "$HOME/.tmux.conf"
+    elif [[ -e ${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf ]]; then printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf"
+    else printf '%s' "$HOME/.tmux.conf"; fi
+}
+
+# Back up a file once as .sh-tafeta.orig (the pre-install original, never
+# overwritten) and every time as .sh-tafeta.bak (the previous version).
+backup_file() {
+    [[ -f $1 ]] || return 0
+    [[ -e $1.sh-tafeta.orig ]] || cp -p "$1" "$1.sh-tafeta.orig"
+    cp -p "$1" "$1.sh-tafeta.bak"
+}
+
+# Rewrite a file in place, keeping its mode and writing through symlinks
+replace_file() {   # target tmpfile
+    local real
+    real=$(readlink -f "$1")
+    if [[ -e $real ]]; then
+        chmod --reference="$real" "$2" 2>/dev/null || chmod "$(stat -c %a "$real")" "$2"
+    fi
+    mv -f "$2" "$real"
+}
+
+# Add or remove the tracking hook in Claude Code's settings.json
+edit_hooks() {   # add|remove hook_command
+    local settings="$CLAUDE_DIR/settings.json" real tmp
+    mkdir -p "$CLAUDE_DIR"
+    real=$(readlink -f "$settings")
+    tmp="$real.sh-tafeta.tmp"
+    python3 -I - "$real" "$1" "$2" "$tmp" <<'PY' || return 1
+import json, os, sys
+path, action, command, tmp = sys.argv[1:5]
+data = {}
+if os.path.exists(path) and os.path.getsize(path) > 0:
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except ValueError as e:
+        sys.exit("%s is not plain JSON (%s): add the hooks by hand, see README" % (path, e))
+hooks = data.setdefault("hooks", {})
+def ours(h):
+    c = h.get("command", "")
+    return "sh-tafeta" in c and (" track" in c or " snapshot" in c)
+for event in ("SessionStart", "UserPromptSubmit"):
+    groups = hooks.get(event, [])
+    for g in groups:
+        g["hooks"] = [h for h in g.get("hooks", []) if not ours(h)]
+    groups = [g for g in groups if g.get("hooks")]
+    if action == "add":
+        groups.append({"hooks": [{"type": "command", "command": command, "timeout": 10, "async": True}]})
+    if groups:
+        hooks[event] = groups
+    else:
+        hooks.pop(event, None)
+if not hooks:
+    data.pop("hooks", None)
+with open(tmp, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+    backup_file "$real"
+    replace_file "$settings" "$tmp"
+}
+
+tpm_dir() {
+    local d
+    for d in "$HOME/.tmux/plugins/tpm" "${XDG_CONFIG_HOME:-$HOME/.config}/tmux/plugins/tpm"; do
+        [[ -d $d ]] && { printf '%s' "$d"; return 0; }
+    done
+    return 1
+}
+
+# Install TPM next to the tmux config in use, enable it, install the plugins
+install_tpm() {
+    local conf real tpm
+    conf=$(tmux_conf_path)
+    [[ -e $conf ]] || : >"$conf"
+    real=$(readlink -f "$conf")
+    if ! tpm=$(tpm_dir); then
+        have git || { warn "git is needed to install TPM"; return 1; }
+        if [[ $conf == "${XDG_CONFIG_HOME:-$HOME/.config}/tmux/"* ]]; then tpm="${XDG_CONFIG_HOME:-$HOME/.config}/tmux/plugins/tpm"
+        else tpm="$HOME/.tmux/plugins/tpm"; fi
+        git clone -q --depth 1 https://github.com/tmux-plugins/tpm "$tpm" || { warn "git clone of TPM failed"; return 1; }
+        info "TPM installed in ${tpm/#$HOME/\~}"
+    fi
+    if ! grep -q 'tpm/tpm' "$real"; then
+        printf "\nrun '%s'\n" "${tpm/#$HOME/\~}/tpm" >>"$real"
+        info "TPM enabled at the end of $conf"
+    fi
+    # TPM reads the config of the running tmux server: reload it first
+    if tmux list-sessions >/dev/null 2>&1; then tmux source-file "$conf" >/dev/null 2>&1; fi
+    if [[ -x $tpm/bin/install_plugins ]] && "$tpm/bin/install_plugins" >/dev/null 2>&1; then info "tmux plugins installed"; fi
+    return 0
+}
+
+cmd_install() {
+    local bin_dir="$HOME/.local/bin" hooks=1 tmuxconf=1 with_tpm=0
+    while (($#)); do
+        case $1 in
+            --bin-dir) bin_dir=${2:?}; shift ;;
+            --no-hooks) hooks=0 ;;
+            --no-tmux) tmuxconf=0 ;;
+            --with-tpm) with_tpm=1 ;;
+            -h|--help) echo "usage: $PROG install [--bin-dir DIR] [--no-hooks] [--no-tmux] [--with-tpm]"; return 0 ;;
+            *) die "unknown option: $1" ;;
+        esac
+        shift
+    done
+    ((hooks)) && ! have python3 && die "install needs python3 to edit $CLAUDE_DIR/settings.json (or use --no-hooks)"
+
+    mkdir -p "$bin_dir"
+    ln -sfn "$SELF" "$bin_dir/$PROG"
+    info "linked $bin_dir/$PROG -> $SELF"
+    [[ ":$PATH:" == *":$bin_dir:"* ]] || warn "$bin_dir is not in your PATH: add it in ~/.bashrc (before any 'return if not interactive' line)"
+
+    if ((hooks)); then
+        local cmd
+        if [[ $bin_dir == "$HOME"/* ]]; then cmd="\"\$HOME${bin_dir#"$HOME"}/$PROG\" track"
+        else cmd="\"$bin_dir/$PROG\" track"; fi
+        edit_hooks add "$cmd" || die "could not update $CLAUDE_DIR/settings.json"
+        info "Claude Code hooks (SessionStart, UserPromptSubmit) added to $CLAUDE_DIR/settings.json"
+    fi
+
+    if ((tmuxconf)); then
+        local conf real line tmp
+        conf=$(tmux_conf_path)
+        [[ -e $conf ]] || : >"$conf"
+        real=$(readlink -f "$conf")
+        line="source-file '$TMUX_SNIPPET'"
+        if grep -qF "$TMUX_SNIPPET" "$real"; then
+            info "tmux config already sources sh-tafeta"
+        else
+            tmp="$real.sh-tafeta.tmp"
+            # plugins must be declared before TPM is run
+            awk -v l="$line" '!done && /^[[:space:]]*run(-shell)?[[:space:]].*tpm/ { print "# sh-tafeta: resume Claude Code sessions after a reboot"; print l; done = 1 } { print } END { if (!done) { print ""; print "# sh-tafeta: resume Claude Code sessions after a reboot"; print l } }' "$real" >"$tmp"
+            backup_file "$real"
+            replace_file "$conf" "$tmp"
+            info "added sh-tafeta to $conf"
+        fi
+        if ((with_tpm)); then
+            install_tpm
+        elif ! tpm_dir >/dev/null; then
+            warn "TPM not found. Install it, then press prefix + I inside tmux:"
+            warn "  git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm"
+            grep -q 'tpm/tpm' "$real" || warn "  and add as LAST line of $conf:  run '~/.tmux/plugins/tpm/tpm'"
+        else
+            info "inside tmux: reload the config and press prefix + I to install the plugins"
+        fi
+    fi
+    info "${C_GRN}installed${C_0}. Run '$PROG doctor' to check everything."
+}
+
+cmd_uninstall() {
+    have python3 || die "uninstall needs python3 to edit $CLAUDE_DIR/settings.json"
+    if [[ -f $CLAUDE_DIR/settings.json ]]; then
+        edit_hooks remove "" || die "could not update $CLAUDE_DIR/settings.json"
+        info "removed hooks from $CLAUDE_DIR/settings.json"
+    fi
+    local conf real tmp
+    conf=$(tmux_conf_path)
+    real=$(readlink -f "$conf")
+    if [[ -f $real ]] && grep -qF "$TMUX_SNIPPET" "$real"; then
+        tmp="$real.sh-tafeta.tmp"
+        # only the two lines install added
+        awk -v s="source-file '$TMUX_SNIPPET'" '$0 != s && $0 != "# sh-tafeta: resume Claude Code sessions after a reboot"' "$real" >"$tmp"
+        backup_file "$real"
+        replace_file "$conf" "$tmp"
+        info "removed sh-tafeta from $conf"
+    fi
+    if grep -qi microsoft /proc/version 2>/dev/null && [[ -f $REPO_DIR/libexec/setup.bash ]]; then
+        # shellcheck source=libexec/setup.bash
+        . "$REPO_DIR/libexec/setup.bash"
+        windows_ps -StopShots >/dev/null 2>&1
+        remove_shortcuts '*'
+        windows_ps -Target '*' -Remove >/dev/null 2>&1
+        info "Windows: screenshot bridge stopped, shortcuts and Terminal entries removed"
+    fi
+    local link="$HOME/.local/bin/$PROG"
+    [[ -L $link ]] && rm -f "$link" && info "removed $link"
+    info "kept: state in $STATE_DIR, config in $CONFIG_DIR"
+    if [[ -d $CONFIG_DIR/hosts ]] && compgen -G "$CONFIG_DIR/hosts/*.conf" >/dev/null; then
+        info "remote hosts are still set up (ssh alias, key, sh-tafeta there): run 'sh-tafeta host remove NAME' for each BEFORE uninstalling, or remove ~/.ssh/config.d/sh-tafeta.conf by hand"
+    fi
+}
+
+# ---------- doctor ----------
+
+cmd_doctor() {
+    load_config
+    local ok="${C_GRN}ok${C_0}" ko="${C_RED}!!${C_0}" mid="${C_YEL}--${C_0}"
+    line() { printf '  [%s] %s\n' "$1" "$2"; }
+
+    printf '%s\n' "${C_B}sh-tafeta $VERSION doctor${C_0}"
+    if have "$PROG"; then line "$ok" "$PROG in PATH"; else line "$ko" "$PROG not in PATH (run: $SELF install)"; fi
+    if have claude; then line "$ok" "claude: $(command -v claude)"; else line "$ko" "claude not found in PATH"; fi
+    if have tmux; then line "$ok" "$(tmux -V)"; else line "$ko" "tmux not installed"; fi
+    if have python3; then line "$ok" "python3 $(python3 -I -c 'import platform; print(platform.python_version())') (sync, install)"
+    else line "$ko" "python3 missing: sync and install won't work"; fi
+    if have flock; then line "$ok" "flock available"; else line "$mid" "flock missing: pane map writes are not locked"; fi
+
+    if [[ -f $CLAUDE_DIR/settings.json ]] && grep -q "$PROG.*track" "$CLAUDE_DIR/settings.json"; then
+        line "$ok" "Claude Code hooks installed"
+    else
+        line "$ko" "Claude Code hooks missing (run: $PROG install)"
+    fi
+
+    local plugin=""
+    if plugin=$(resurrect_plugin_dir); then line "$ok" "tmux-resurrect: $plugin"
+    else line "$ko" "tmux-resurrect not installed (prefix + I inside tmux)"; fi
+    if [[ -n $plugin && -d ${plugin%/*}/tmux-continuum ]]; then line "$ok" "tmux-continuum installed"
+    else line "$ko" "tmux-continuum not installed"; fi
+
+    if tmux list-sessions >/dev/null 2>&1; then
+        local rp
+        rp=$(tmux show-option -gqv @resurrect-processes)
+        if [[ $rp == *"$PROG resume"* ]]; then line "$ok" "tmux restores Claude panes with '$PROG resume'"
+        else line "$ko" "@resurrect-processes does not use '$PROG resume' (current: ${rp:-unset}) — is it overridden after the source-file line?"; fi
+        if [[ $(tmux show-option -gqv @resurrect-hook-post-save-all) == *"$PROG snapshot"* ]]; then line "$ok" "layout snapshots record Claude sessions"
+        else line "$ko" "@resurrect-hook-post-save-all is not '$PROG snapshot' (overridden?)"; fi
+        if [[ $(tmux show-option -gqv @continuum-restore) == on ]]; then line "$ok" "continuum auto-restore on"
+        else line "$mid" "continuum auto-restore off"; fi
+    else
+        line "$mid" "tmux server not running: skipped live checks"
+    fi
+
+    local last
+    last="$(resurrect_save_dir)/last"
+    if [[ -e $last ]]; then
+        local age sessions
+        age=$(($(date +%s) - $(stat -L -c %Y "$last" 2>/dev/null || echo 0)))
+        sessions=$(awk -F'\t' '$1 == "pane" { print $2 }' "$last" | sort -u | wc -l)
+        line "$ok" "last layout snapshot: $sessions session(s), $((age / 60)) min ago"
+    else
+        line "$mid" "no tmux-resurrect snapshot yet"
+    fi
+
+    if [[ -f $SAVED_MAP ]]; then
+        line "$ok" "Claude sessions in the last snapshot: $(wc -l <"$SAVED_MAP")"
+    else
+        line "$mid" "no Claude session recorded in a snapshot yet (fills up as you use Claude Code inside tmux)"
+    fi
+    if [[ -n ${TMUX_PANE:-} ]]; then
+        line "$ok" "this pane would run: $(cmd_resume --dry-run)"
+    fi
+    local bdir="$STATE_DIR/backups"
+    if [[ -d $bdir ]]; then
+        line "$ok" "sync backups: $(du -sh "$bdir" 2>/dev/null | cut -f1) in $bdir (pruned after 30 days, last 20 kept)"
+    fi
+    if grep -qi microsoft /proc/version 2>/dev/null; then
+        line "$mid" "WSL detected: start tmux with '$PROG restore' (or the Windows launcher) to survive the boot clock jump"
+    fi
+}
+
+# ---------- help ----------
+
+help_sync() {
+    cat <<EOF
+usage: $PROG sync HOST [push|pull|both] [options]
+
+Two-way sync of Claude Code sessions and project memory with another machine
+over SSH (python3 needed on both). It never overwrites work it hasn't seen:
+
+  * decisions use content hashes against the state of the last sync, never
+    dates: clock skew or a git checkout cannot make old content win
+  * changed on one side only        -> copied
+  * a session continued elsewhere   -> the missing turns are appended
+  * changed on both sides           -> CONFLICT: both versions kept, nothing overwritten
+  * a session continued on BOTH     -> DIVERGED: nothing overwritten, other copy saved aside
+  * deletions are never propagated; replaced files are backed up
+  * exit code 2 when something needs your attention
+
+Which projects: the current one (or its closest parent Claude Code knows),
+--project PATH, --all, or PROJECTS in ~/.config/sh-tafeta/hosts/HOST.conf.
+
+options:
+  -n, --dry-run       show the plan, change nothing
+  -p, --project P     sync this project (repeatable)
+  -a, --all           every project with a PATH_MAP entry, on both sides
+      --with-config   also CLAUDE.md, keybindings, agents, commands, skills, output styles
+                      (never settings.json, never credentials)
+      --with-source   also the project files (git-ignored files and secrets excluded,
+                      .git excluded: use git for code). Needs --project or the current dir.
+      --force=local|remote  resolve every conflict in favour of one side (backed up)
+      --include-live  also write sessions that Claude Code is writing right now
+      --break-lock    take over the lock of a sync that died
+      --init          write ~/.config/sh-tafeta/hosts/HOST.conf and stop
+  -y, --yes           don't ask for confirmation
+  -v, --verbose       list every file
+
+Paths: Claude Code keys sessions by absolute path. When the remote home differs
+(/home/alice vs /home/bob), \$HOME is mapped automatically; for anything else
+(~/Projects vs ~/code) edit PATH_MAP in the host config.
+EOF
+}
+
+cmd_help() {
+    case ${1:-} in
+        sync) help_sync; return 0 ;;
+    esac
+    cat <<EOF
+${C_B}sh-tafeta${C_0} $VERSION — hand your Claude Code sessions over across reboots, terminals and machines.
+
+usage: $PROG <command> [args]
+
+  restore                 start tmux and restore every saved session (WSL-safe)
+  ls [HOST]               list tmux sessions, locally or on HOST, with their Claude panes
+  rename OLD NEW [HOST]   rename a tmux session and keep its Claude mapping
+  sync HOST [push|pull|both] [opts]   safe two-way sync over SSH ($PROG help sync)
+  shot HOST|local FILE... copy screenshots where Claude Code runs, print their paths
+
+  setup                   guided setup: this machine, remote hosts, Windows shortcuts
+  host add|remove|list    manage remote hosts (ssh alias, key, remote install, path map)
+  windows shortcut|profile|autostart|shots|remove   Windows integration (from WSL)
+  open wsl|HOST           what the desktop shortcuts run: one Windows Terminal tab per session
+
+  install                 link the binary, add Claude Code hooks, wire up tmux
+  uninstall               undo install (state is kept)
+  doctor                  check that every piece is in place
+
+  track                   (hook) map this tmux pane to its Claude Code session
+  snapshot                (tmux-resurrect hook) record sessions next to the layout snapshot
+  resume [--dry-run]      (tmux-resurrect) reopen this pane's exact session
+
+Windows Terminal: windows/sh-tafeta.ps1 opens one tab per session (WSL or SSH host).
+Config: $CONFIG_DIR/config   State: $STATE_DIR
+EOF
+}
+
+# ---------- main ----------
+
+main() {
+    local cmd=${1:-help}
+    (($#)) && shift
+    case $cmd in
+        track)     cmd_track "$@" ;;
+        snapshot)  cmd_snapshot "$@" ;;
+        restored-mark) cmd_restored_mark ;;
+        resume)    cmd_resume "$@" ;;
+        restore|up) cmd_restore "$@" ;;
+        ls|list)   cmd_ls "$@" ;;
+        rename)    cmd_rename "$@" ;;
+        sync)      load_config; cmd_sync "$@" ;;
+        shot)      load_config; cmd_shot "$@" ;;
+        setup|host|windows|open|autostart)
+            # shellcheck source=libexec/setup.bash
+            . "$REPO_DIR/libexec/setup.bash"
+            "cmd_$cmd" "$@" ;;
+        install)   cmd_install "$@" ;;
+        uninstall) cmd_uninstall "$@" ;;
+        doctor)    cmd_doctor "$@" ;;
+        version|--version|-V) echo "$PROG $VERSION" ;;
+        help|--help|-h) cmd_help "$@" ;;
+        *) die "unknown command '$cmd' (try: $PROG help)" ;;
+    esac
+}
+
+main "$@"

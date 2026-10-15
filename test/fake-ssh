@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Test double for ssh: runs the "remote" command locally, as another machine whose
+# home is $FAKE_REMOTE_HOME, with a clean environment (like a real ssh login).
+while (($#)); do
+    case $1 in
+        -o|-p|-i|-l|-F|-J) shift 2 ;;
+        --) shift; break ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+shift   # host
+[[ ${FAKE_SSH_FAIL:-} == 1 ]] && { echo "ssh: connect to host: Connection refused" >&2; exit 255; }
+[[ -n ${FAKE_REMOTE_HOME:-} ]] || { echo "fake-ssh: FAKE_REMOTE_HOME not set" >&2; exit 255; }
+cd "$FAKE_REMOTE_HOME" || exit 255
+exec env -i HOME="$FAKE_REMOTE_HOME" PATH="${FAKE_REMOTE_PATH:-$PATH}" LANG=C.UTF-8 \
+    SHTAFETA_TEST_CLAUDE_RUNNING="${FAKE_REMOTE_CLAUDE_RUNNING:-0}" bash -c "$*"
