@@ -555,5 +555,7 @@ if (-not $ListOnly) {
     }
     Write-Host ''
     Write-Step 'All sessions attached.' 'Green'
+    # the tabs live in their own window: close this one, unless it is the bridge
+    if (-not $Shots) { exit 0 }
 }
 Finish 0

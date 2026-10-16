@@ -480,7 +480,7 @@ shots_ps_args() {
 }
 
 # What a desktop shortcut runs: open one Windows Terminal tab per tmux session of TARGET
-# (and, if the screenshot bridge belongs to this window, keep running as the bridge).
+# (and start the screenshot bridge in the background, if it belongs to this target).
 cmd_open() {
     local target=${1:-wsl} nopause=0 list=0
     [[ ${2:-} == --no-pause ]] && nopause=1
@@ -493,10 +493,10 @@ cmd_open() {
     [[ $target != wsl ]] && a+=(-Transport "$(host_transport "$target")")
     ((nopause)) && a+=(-NoPause)
     ((list)) && a+=(-ListOnly -NoPause)
+    # the bridge runs hidden on its own, not in the launcher window: closing that window
+    # (or the tabs) no longer stops it; it lasts until logout or `windows shots --stop`
     if ((!list)) && [[ $SHOTS_MODE == window && $SHOTS_TARGET == "$target" ]]; then
-        local x
-        a+=(-Shots)
-        while IFS= read -r x; do a+=("$x"); done < <(shots_ps_args)
+        shots_start_background || warn "could not start the screenshot bridge"
     fi
     cd /mnt/c || exit 1
     exec "$PS_EXE" "${a[@]}"
@@ -694,7 +694,7 @@ setup_windows() {
         SHOTS_TARGET=$to
         folder=$(ask "also send images saved in this Windows folder ('-' = clipboard only)" "${SHOTS_FOLDER:--}")
         if [[ $folder == - ]]; then SHOTS_FOLDER=""; SHOTS_FROM=clipboard; else SHOTS_FOLDER=$folder; SHOTS_FROM=both; fi
-        if confirm "keep it always on from login (no = only while the 'sh-tafeta $(shortcut_label "$to")' window is open)" "$( [[ $SHOTS_MODE == background ]] && echo y || echo n)"; then
+        if confirm "keep it always on from login (no = from the first 'sh-tafeta $(shortcut_label "$to")' shortcut until logout)" "$( [[ $SHOTS_MODE == background ]] && echo y || echo n)"; then
             SHOTS_MODE=background
         else
             SHOTS_MODE=window
