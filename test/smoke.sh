@@ -14,7 +14,8 @@ unset CLAUDE_CONFIG_DIR SHTAFETA_STATE_DIR SHTAFETA_CONFIG_DIR TMUX_PLUGIN_MANAG
 mkdir -p "$HOME/.claude/projects/-tmp-app"
 MAP="$XDG_STATE_HOME/sh-tafeta/pane-map.tsv"
 
-cleanup() { tmux -L "$SOCK" kill-server 2>/dev/null; rm -rf "$T"; }
+# by path: the restore tests below change TMUX_TMPDIR, so -L would look for the socket elsewhere
+cleanup() { [[ -n ${SOCKET_PATH:-} ]] && { tmux -S "$SOCKET_PATH" kill-server 2>/dev/null; rm -f "$SOCKET_PATH"; }; rm -rf "$T"; }
 trap cleanup EXIT
 
 check() {   # description, expected, actual
