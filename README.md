@@ -2,7 +2,7 @@
 
 <p align="center">
   <b>Hand your Claude Code sessions over across reboots, terminals and machines.</b><br>
-  <i>From the Italian <b>staffetta</b> — relay race. Nobody stops swimming: one touches the wall, the next one is already in the water.</i>
+  <i><b>sh</b> + <b>staffetta</b> (Italian for relay race), the way my coach Bane used to say it: "shtafeta". Nobody stops swimming: one touches the wall, the next one is already in the water.</i>
 </p>
 
 <p align="center">
