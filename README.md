@@ -12,20 +12,24 @@
   <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="MIT">
 </p>
 
-<p align="center"><img src="docs/demo.gif" alt="After a reboot, a double-click on the sh-tafeta shortcut restores tmux and every pane reopens its own Claude Code conversation" width="800"></p>
-<p align="center"><sub>Recorded on a clean Windows + WSL2 machine; Claude Code is a labelled stand-in in the recording.</sub></p>
+<p align="center"><img src="docs/demo.gif" alt="After Windows reboots, a double-click on the sh-tafeta shortcut opens one Windows Terminal tab per tmux session, every pane back in its own Claude Code conversation; then a screenshot taken with Win+Shift+S is pasted into Claude on the server with Ctrl+V" width="800"></p>
+<p align="center"><sub>Illustration made from real Claude Code screens.</sub></p>
 
 ---
 
-You run Claude Code in tmux. Several sessions, often in the **same folder**. Then:
+You use Claude Code from the terminal: several sessions in tmux, often in the **same folder**, some in WSL and some on a remote dev server.
+
+When Windows crashes, or wakes from hibernation by rebooting instead (more often than it should), nothing is really lost: tmux on the server is still running, and `claude --resume` can reopen any conversation. What you lose is the time it takes to put everything back **exactly as it was**: one tab per session, every pane in front of its own conversation, each one picked by hand from a list where conversations from the same folder all look alike. And with Claude on a server there's a smaller pain every day: your screenshots are on Windows, Claude isn't.
+
+sh-tafeta puts it all back with one double click, and takes care of the rest:
 
 | What happens | What you get without sh-tafeta | With sh-tafeta |
 |---|---|---|
-| 💥 The PC reboots | tmux-resurrect brings back the layout, but Claude panes start **empty** — or, with `claude --continue`, **every pane in the same folder opens the same conversation** | Every pane reopens **its own** conversation (`claude --resume <id>`) |
+| 💥 The PC crashes or reboots | tmux-resurrect brings back the layout, but Claude panes start **empty** — or, with `claude --continue`, **every pane in the same folder opens the same conversation** | Every pane reopens **its own** conversation (`claude --resume <id>`) |
 | 🕐 WSL boots and the clock jumps forward | tmux-continuum thinks the server is old, **silently skips the restore**, and 10 minutes later overwrites your snapshot with an empty layout | `sh-tafeta restore` notices and restores anyway |
-| 🪟 You live in Windows Terminal | One tab, then `tmux attach -t …` by hand, for every session, every morning | One click: **one tab per tmux session**, with readable titles — locally in WSL or on a remote box over ssh/mosh |
-| 📸 Claude runs on a server, your screenshots are on Windows | Save, `scp`, type the path… for every screenshot | `Win+Shift+S`, then `Ctrl+V` in Claude: the image is already there and its path on the clipboard |
-| 🛫 You move between laptop and server | Sessions and project memory stay on the machine where they were created (Claude Code keys them by absolute path) — and "newest file wins" sync tools happily overwrite real work with an old copy that has a fresh date | `sh-tafeta sync devbox` — paths mapped, decisions by content against the last sync, **never overwrites work it hasn't seen** |
+| 🪟 You live in Windows Terminal | The server sessions survived, but you reattach them by hand: one tab and `tmux attach -t …` for each, after every crash | One click: **one tab per tmux session**, with readable titles — locally in WSL or on a remote box over ssh/mosh |
+| 📸 Claude runs on a server, your screenshots are on Windows | Locally you just paste the image. Remotely: save, `scp`, type the path… for every screenshot | `Win+Shift+S`, then `Ctrl+V` in Claude: the image is already there and its path on the clipboard |
+| 🛫 You started on the laptop, but the work belongs on the server (or the other way round) | Sessions and project memory stay on the machine where they were created (Claude Code keys them by absolute path) — and "newest file wins" sync tools happily overwrite real work with an old copy that has a fresh date | `sh-tafeta sync devbox` moves the conversation, the project memory and, with `--with-source`, the files: you pick up where you left off. Paths mapped, decisions by content against the last sync, **never overwrites work it hasn't seen** |
 
 ## How it works
 
@@ -183,7 +187,7 @@ Good tools exist; pick the one that fits.
 - You want to drive a session from your phone → Claude Code's built-in Remote Control.
 - You want parallel agents in git worktrees → [claude-squad](https://github.com/smtg-ai/claude-squad) or [ccmanager](https://github.com/kbwo/ccmanager).
 
-sh-tafeta is for the workflow in between: many long-lived Claude Code sessions in tmux, on a Windows/WSL desk and a Linux box, that must survive reboots and travel between the two.
+Each of these does its part well. sh-tafeta exists because none of them did all of it together for this workflow: many long-lived Claude Code sessions in tmux, on a Windows/WSL desk and a Linux box, that must come back exactly as they were after a crash, take screenshots from Windows, and travel between the two machines.
 
 ## Credits
 
