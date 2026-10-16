@@ -617,8 +617,8 @@ apply_windows_conf() {
 }
 
 windows_shots() {
-    local target=${1:-} folder="" mode=window
-    (($#)) && shift
+    local target="" folder="" mode=window
+    if [[ ${1:-} != -* ]]; then target=${1:-}; (($#)) && shift; fi
     while (($#)); do
         case $1 in
             --folder) folder=${2:?}; shift ;;

@@ -77,7 +77,11 @@ $IsLocal = $Target -eq 'wsl'
 $NoiseCommands = @('bash', 'zsh', 'sh', 'fish', 'dash', 'login', 'tmux', '-bash', 'mosh-server', 'sshd')
 $HomeMarker = '__SHTAFETA_HOME__'
 
-function Write-Step([string]$Text, [string]$Color = 'Gray') { Write-Host "  $Text" -ForegroundColor $Color }
+function Write-Step([string]$Text, [string]$Color = 'Gray') {
+    Write-Host "  $Text" -ForegroundColor $Color
+    # the hidden bridge has no window: it writes what it does here instead
+    if ($script:ShotsLog) { try { Add-Content -Path $script:ShotsLog -Value ("{0:yyyy-MM-dd HH:mm:ss}  {1}" -f (Get-Date), $Text) } catch { } }
+}
 
 function Wait-Exit([int]$Code = 0) {
     if (-not $NoPause) {
@@ -238,6 +242,21 @@ function Set-ClipboardPath([string]$Text, $Image) {
     return $false
 }
 
+# The Snipping Tool writes the clipboard more than once (the image, then the clipboard
+# history and cloud formats), so a new sequence number alone doesn't mean you copied
+# something else: it did only if the clipboard no longer holds that same image.
+function Test-ClipboardStill($Image) {
+    if (-not $Image) { return $false }
+    try {
+        if ([System.Windows.Forms.Clipboard]::ContainsText() -or -not [System.Windows.Forms.Clipboard]::ContainsImage()) { return $false }
+        $now = [System.Windows.Forms.Clipboard]::GetImage()
+        if (-not $now) { return $false }
+        $same = $now.Width -eq $Image.Width -and $now.Height -eq $Image.Height
+        $now.Dispose()
+        return $same
+    } catch { return $false }
+}
+
 # Deliver one image through sh-tafeta in WSL (same ssh config and keys as everything
 # else); WSLENV hands the path over already translated (/p), so no quoting is involved.
 # Returns the path on the target, or $null.
@@ -253,7 +272,7 @@ function Send-Shot([string]$Path, [string]$To, $Notify, $Image, $ExpectSeq = $nu
     $dest = @($out | Where-Object { "$_" -match '^/[^\x00-\x1f]*$' }) | Select-Object -Last 1
     $name = Split-Path $Path -Leaf
     if ($code -eq 0 -and $dest) {
-        if ($null -ne $ExpectSeq -and [ShTafeta.Clip]::GetClipboardSequenceNumber() -ne $ExpectSeq) {
+        if ($null -ne $ExpectSeq -and [ShTafeta.Clip]::GetClipboardSequenceNumber() -ne $ExpectSeq -and -not (Test-ClipboardStill $Image)) {
             # you copied something else while it was uploading: leave your clipboard alone
             Write-Step "$name -> $dest  (clipboard changed meanwhile: path NOT copied)" 'Yellow'
             if ($Notify) { $Notify.ShowBalloonTip(3000, 'sh-tafeta', "Screenshot sent to ${To} (clipboard left as you changed it)", 'Info') }
@@ -291,6 +310,10 @@ function Start-ShotsBridge {
     }
     $script:OrigWslEnv = $env:WSLENV
     New-Item -ItemType Directory -Force -Path (Split-Path $ShotsPidFile) | Out-Null
+    if ($ShotsOnly) {
+        $script:ShotsLog = Join-Path (Split-Path $ShotsPidFile) 'shots.log'
+        Set-Content -Path $script:ShotsLog -Value ("{0:yyyy-MM-dd HH:mm:ss}  bridge started (pid {1})" -f (Get-Date), $PID)
+    }
     Set-Content -Path $ShotsPidFile -Value $PID
     Add-Type -AssemblyName System.Windows.Forms, System.Drawing
     if (-not ('ShTafeta.Clip' -as [type])) {

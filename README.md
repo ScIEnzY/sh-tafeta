@@ -119,7 +119,7 @@ Win+Shift+S → "Screenshot sent to devbox: Ctrl+V pastes its path" → Ctrl+V i
 
 - It watches the **clipboard** — **every** image copied without text, not only screenshots: `Win+Shift+S`, PrintScreen, "copy image" in most apps. Each one is sent to the target, and a copy stays in `%LOCALAPPDATA%\sh-tafeta\clipboard` for a day; use `-ShotsFrom folder` if that's too much — and, optionally, a **folder** (`Pictures\Screenshots` by default — `-ShotsFrom clipboard|folder|both`). A snip that is both copied and saved is sent once.
 - The clipboard then holds **both** the image and the path: a terminal pastes the path, Word or Teams still paste the picture.
-- `setup` turns it on for one target; it starts hidden when you open that host's desktop shortcut (closing the tabs doesn't stop it; it lasts until logout), or from login (`sh-tafeta windows shots devbox --background`, stop with `--stop`). Only one bridge runs at a time.
+- `setup` turns it on for one target; it starts hidden when you open that host's desktop shortcut (closing the tabs doesn't stop it; it lasts until logout), or from login (`sh-tafeta windows shots devbox --background`, stop with `--stop`). Only one bridge runs at a time; the hidden one logs to `%LOCALAPPDATA%\sh-tafeta\shots.log`.
 - On the target, images go to `~/.cache/sh-tafeta/screenshots` (`SHOTS_DIR` in the host config), with clean names, never overwriting. A folder sh-tafeta creates is private to you and `SHOTS_KEEP_DAYS` (default 30, `0` = forever) prunes old images there; an existing folder you point it to is never pruned nor re-permissioned. Your own files are never renamed or moved.
 - Without Windows: `sh-tafeta shot devbox ~/Pictures/shot.png` prints the remote path; bind it to a hotkey on a Linux or macOS desktop.
 
